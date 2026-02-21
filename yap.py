@@ -1,609 +1,656 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import csv
+import tkinter as tk
 from dataclasses import dataclass
+from tkinter import filedialog, messagebox, ttk
 
-# =========================
-# МОЛЕКУЛЯРНАЯ ДИНАМИКА В СФЕРЕ (LJ + Velocity Verlet)
-# =========================
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.animation import FuncAnimation
+
 
 @dataclass
-class MDParams:
+class SimulationParameters:
     n_particles: int = 800
     sphere_radius: float = 12.0
     dt: float = 0.002
     steps_per_frame: int = 2
-    mass: float = 1.0
+    particle_mass: float = 1.0
     temperature: float = 1.0
     epsilon: float = 1.0
     sigma: float = 1.0
-    cutoff: float = 2.5
-    wall_kick_damping: float = 1.0  # 1.0 = абсолютно упруго
+    cutoff_sigma: float = 2.5
+    wall_restitution: float = 1.0
     seed: int | None = None
-    init_min_dist: float = 0.9
-    track_index: int = 0
+    init_min_distance_sigma: float = 0.9
+    tracked_particle_index: int = 0
     save_every: int = 10
-    max_traj_points: int = 500
+    max_trajectory_points: int = 500
 
 
-class LJMDInSphere:
-    def __init__(self, p: MDParams):
-        self.p = p
-        self.rng = np.random.default_rng(p.seed)
+class MolecularDynamicsLJ:
+    def __init__(self, params: SimulationParameters) -> None:
+        self.params = params
+        self.rng = np.random.default_rng(params.seed)
 
-        # Приведенные единицы: k_B = 1
-        self.kB = 1.0
+        self.k_b = 1.0  # reduced units
+        self.n_particles = params.n_particles
+        self.radius = float(params.sphere_radius)
 
-        # Центр сферы в начале координат
-        self.R = float(p.sphere_radius)
-        self.N = int(p.n_particles)
-        self.dim = 3
+        self.mass = float(params.particle_mass)
+        self.masses = np.full(self.n_particles, self.mass, dtype=float)
 
-        self.m = np.full(self.N, float(p.mass), dtype=float)
-        self.pos = np.zeros((self.N, 3), dtype=float)
-        self.vel = np.zeros((self.N, 3), dtype=float)
-        self.force = np.zeros((self.N, 3), dtype=float)
+        self.positions = np.zeros((self.n_particles, 3), dtype=float)
+        self.velocities = np.zeros((self.n_particles, 3), dtype=float)
+        self.forces = np.zeros((self.n_particles, 3), dtype=float)
 
         self.time = 0.0
-        self.step_count = 0
+        self.step_index = 0
 
-        # Параметры LJ
-        self.eps = float(p.epsilon)
-        self.sig = float(p.sigma)
-        self.rc = float(p.cutoff) * self.sig
-        self.rc2 = self.rc * self.rc
+        self.epsilon = float(params.epsilon)
+        self.sigma = float(params.sigma)
+        self.cutoff = float(params.cutoff_sigma) * self.sigma
+        self.cutoff_sq = self.cutoff * self.cutoff
 
-        # Сдвиг потенциала на отсечении, чтобы U(rc)=0
-        sr6c = (self.sig / self.rc) ** 6
-        self.U_shift = 4.0 * self.eps * (sr6c * sr6c - sr6c)
+        sigma_over_rc_6 = (self.sigma / self.cutoff) ** 6
+        self.potential_shift = (
+            4.0 * self.epsilon * (sigma_over_rc_6**2 - sigma_over_rc_6)
+        )
 
-        # Инициализация
-        self._init_positions_in_sphere(min_dist=p.init_min_dist * self.sig)
-        self._init_velocities_MB(T=p.temperature)
-
-        # Начальные силы
         self.potential_energy = 0.0
         self.virial = 0.0
-        self.force, self.potential_energy, self.virial = self.compute_forces_cell_list()
 
-        # Журналы
-        self.energy_log = []
-        self.temp_log = []
-        self.pressure_like_log = []
-        self.track_log = []
+        self.energy_log: list[tuple[float, float, float, float]] = []
+        self.temperature_log: list[tuple[float, float]] = []
+        self.pressure_log: list[tuple[float, float]] = []
+        self.track_log: list[tuple[float, float, float, float]] = []
 
+        self._initialize_positions()
+        self._initialize_velocities_maxwell_boltzmann()
+        self.forces, self.potential_energy, self.virial = self.compute_forces()
         self._log_state()
 
-    # -------------------------
-    # ИНИЦИАЛИЗАЦИЯ
-    # -------------------------
-    def _random_point_in_sphere(self, margin=0.0):
-        # Равномерно по объему сферы
+    def _random_point_in_sphere(self, margin: float = 0.0) -> np.ndarray:
+        available_radius = self.radius - margin
         while True:
-            x = self.rng.uniform(-(self.R - margin), self.R - margin, size=3)
-            if np.dot(x, x) <= (self.R - margin) ** 2:
-                return x
+            point = self.rng.uniform(-available_radius, available_radius, size=3)
+            if np.dot(point, point) <= available_radius**2:
+                return point
 
-    def _init_positions_in_sphere(self, min_dist: float):
-        # Простая случайная упаковка без сильных перекрытий
-        # Для тысяч частиц нужна разумная плотность, иначе размещение будет медленным.
-        min_dist2 = min_dist * min_dist
-        for i in range(self.N):
+    def _initialize_positions(self) -> None:
+        min_distance = self.params.init_min_distance_sigma * self.sigma
+        min_distance_sq = min_distance * min_distance
+
+        for i in range(self.n_particles):
             placed = False
             for _ in range(20000):
-                cand = self._random_point_in_sphere(margin=0.2 * self.sig)
+                candidate = self._random_point_in_sphere(margin=0.2 * self.sigma)
+
                 if i == 0:
-                    cand = np.array([0.0, 0.0, 0.0], dtype=float)
-                ok = True
+                    candidate = np.array([0.0, 0.0, 0.0], dtype=float)
+
+                valid = True
                 for j in range(i):
-                    d = cand - self.pos[j]
-                    if np.dot(d, d) < min_dist2:
-                        ok = False
+                    delta = candidate - self.positions[j]
+                    if np.dot(delta, delta) < min_distance_sq:
+                        valid = False
                         break
-                if ok:
-                    self.pos[i] = cand
+
+                if valid:
+                    self.positions[i] = candidate
                     placed = True
                     break
+
             if not placed:
                 raise RuntimeError(
-                    "Не удалось разместить частицы без сильных перекрытий. "
-                    "Уменьшите число частиц, увеличьте радиус сферы или уменьшите init_min_dist."
+                    "Could not place particles without strong overlap. "
+                    "Decrease N, increase sphere radius, or reduce init_min_distance_sigma."
                 )
 
-    def _init_velocities_MB(self, T: float):
-        # Максвелл-Больцман: компоненты скорости гауссовы, sigma_v = sqrt(k_B T / m)
-        sigma_v = np.sqrt(self.kB * T / self.p.mass)
-        self.vel = self.rng.normal(0.0, sigma_v, size=(self.N, 3))
+    def _initialize_velocities_maxwell_boltzmann(self) -> None:
+        sigma_v = np.sqrt(self.k_b * self.params.temperature / self.mass)
+        self.velocities = self.rng.normal(0.0, sigma_v, size=(self.n_particles, 3))
 
-        # Убираем суммарный импульс, чтобы центр масс не дрейфовал
-        v_cm = np.mean(self.vel, axis=0)
-        self.vel -= v_cm
+        center_of_mass_velocity = np.mean(self.velocities, axis=0)
+        self.velocities -= center_of_mass_velocity
 
-        # Точно подгоняем температуру: T = (2K)/(3N-3) при нулевом импульсе
-        K = self.kinetic_energy()
-        dof = 3 * self.N - 3
-        if dof > 0 and K > 0:
-            T_current = 2.0 * K / dof
-            scale = np.sqrt(T / T_current)
-            self.vel *= scale
+        kinetic = self.kinetic_energy()
+        dof = 3 * self.n_particles - 3
+        if dof > 0 and kinetic > 0:
+            current_temperature = 2.0 * kinetic / dof
+            scale = np.sqrt(self.params.temperature / current_temperature)
+            self.velocities *= scale
 
-    # -------------------------
-    # СИЛЫ ЛЕННАРДА-ДЖОНСА + CELL LIST
-    # -------------------------
-    def compute_forces_cell_list(self):
-        forces = np.zeros_like(self.pos)
-        U = 0.0
-        virial = 0.0
+    def _lj_force_energy_virial(
+        self,
+        delta: np.ndarray,
+        distance_sq: float,
+    ) -> tuple[np.ndarray, float, float]:
+        inv_r2 = 1.0 / distance_sq
+        sigma_r_sq = (self.sigma * self.sigma) * inv_r2
+        sigma_r_6 = sigma_r_sq**3
+        sigma_r_12 = sigma_r_6**2
 
-        # Куб, описанный вокруг сферы: [-R, R]^3
-        box_min = -self.R
-        box_max = self.R
+        potential = (
+            4.0 * self.epsilon * (sigma_r_12 - sigma_r_6) - self.potential_shift
+        )
 
-        # Размер ячейки берем не меньше радиуса отсечения
-        cell_size = self.rc
-        ncell = max(1, int(np.floor((box_max - box_min) / cell_size)))
-        cell_size = (box_max - box_min) / ncell
+        coefficient = (
+            24.0 * self.epsilon * (2.0 * sigma_r_12 - sigma_r_6) * inv_r2
+        )
+        force_vector = coefficient * delta
 
-        # Раскладка частиц по ячейкам
-        cells = {}
-        idx_all = np.arange(self.N)
+        virial_pair = float(np.dot(delta, force_vector))
+        return force_vector, potential, virial_pair
 
-        scaled = (self.pos - box_min) / cell_size
-        cid = np.floor(scaled).astype(int)
-        cid = np.clip(cid, 0, ncell - 1)
+    def compute_forces(self) -> tuple[np.ndarray, float, float]:
+        forces = np.zeros_like(self.positions)
+        total_potential = 0.0
+        total_virial = 0.0
 
-        for i in idx_all:
-            key = (cid[i, 0], cid[i, 1], cid[i, 2])
-            if key not in cells:
-                cells[key] = []
-            cells[key].append(i)
+        box_min = -self.radius
+        box_max = self.radius
 
-        # Соседние ячейки
-        neigh_shifts = [(dx, dy, dz)
-                        for dx in (-1, 0, 1)
-                        for dy in (-1, 0, 1)
-                        for dz in (-1, 0, 1)]
+        cell_size = self.cutoff
+        n_cells = max(1, int(np.floor((box_max - box_min) / cell_size)))
+        cell_size = (box_max - box_min) / n_cells
 
-        # Перебор пар без двойного счета
-        visited_pairs_cells = set()
+        scaled = (self.positions - box_min) / cell_size
+        cell_ids = np.floor(scaled).astype(int)
+        cell_ids = np.clip(cell_ids, 0, n_cells - 1)
 
-        for cell_key, plist in cells.items():
+        cells: dict[tuple[int, int, int], list[int]] = {}
+        for i in range(self.n_particles):
+            key = tuple(cell_ids[i])
+            cells.setdefault(key, []).append(i)
+
+        neighbor_shifts = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+        ]
+
+        visited_cell_pairs: set[tuple[tuple[int, int, int], tuple[int, int, int]]] = set()
+
+        for cell_key, particle_list in cells.items():
             cx, cy, cz = cell_key
-            for sh in neigh_shifts:
-                nk = (cx + sh[0], cy + sh[1], cz + sh[2])
-                if nk not in cells:
+
+            for dx, dy, dz in neighbor_shifts:
+                neighbor_key = (cx + dx, cy + dy, cz + dz)
+                if neighbor_key not in cells:
                     continue
 
-                # Чтобы не считать дважды пары ячеек
-                pair_cell = tuple(sorted((cell_key, nk)))
-                if pair_cell in visited_pairs_cells:
+                cell_pair = tuple(sorted((cell_key, neighbor_key)))
+                if cell_pair in visited_cell_pairs:
                     continue
-                visited_pairs_cells.add(pair_cell)
+                visited_cell_pairs.add(cell_pair)
 
-                qlist = cells[nk]
+                neighbor_particles = cells[neighbor_key]
 
-                if cell_key == nk:
-                    # Пары внутри одной ячейки
-                    for a in range(len(plist) - 1):
-                        i = plist[a]
-                        ri = self.pos[i]
-                        for b in range(a + 1, len(plist)):
-                            j = plist[b]
-                            rij = self.pos[j] - ri
-                            r2 = np.dot(rij, rij)
-                            if r2 >= self.rc2 or r2 < 1e-20:
+                if cell_key == neighbor_key:
+                    for a in range(len(particle_list) - 1):
+                        i = particle_list[a]
+                        pos_i = self.positions[i]
+                        for b in range(a + 1, len(particle_list)):
+                            j = particle_list[b]
+                            delta = self.positions[j] - pos_i
+                            distance_sq = float(np.dot(delta, delta))
+
+                            if distance_sq >= self.cutoff_sq or distance_sq < 1e-20:
                                 continue
-                            fij, uij, wij = self._lj_pair_force_energy_virial(rij, r2)
-                            forces[i] -= fij
-                            forces[j] += fij
-                            U += uij
-                            virial += wij
+
+                            f_ij, u_ij, w_ij = self._lj_force_energy_virial(
+                                delta,
+                                distance_sq,
+                            )
+                            forces[i] -= f_ij
+                            forces[j] += f_ij
+                            total_potential += u_ij
+                            total_virial += w_ij
                 else:
-                    # Пары между разными ячейками
-                    for i in plist:
-                        ri = self.pos[i]
-                        for j in qlist:
-                            rij = self.pos[j] - ri
-                            r2 = np.dot(rij, rij)
-                            if r2 >= self.rc2 or r2 < 1e-20:
+                    for i in particle_list:
+                        pos_i = self.positions[i]
+                        for j in neighbor_particles:
+                            delta = self.positions[j] - pos_i
+                            distance_sq = float(np.dot(delta, delta))
+
+                            if distance_sq >= self.cutoff_sq or distance_sq < 1e-20:
                                 continue
-                            fij, uij, wij = self._lj_pair_force_energy_virial(rij, r2)
-                            forces[i] -= fij
-                            forces[j] += fij
-                            U += uij
-                            virial += wij
 
-        return forces, U, virial
+                            f_ij, u_ij, w_ij = self._lj_force_energy_virial(
+                                delta,
+                                distance_sq,
+                            )
+                            forces[i] -= f_ij
+                            forces[j] += f_ij
+                            total_potential += u_ij
+                            total_virial += w_ij
 
-    def _lj_pair_force_energy_virial(self, rij, r2):
-        # LJ в векторной форме
-        # U = 4e[(s/r)^12 - (s/r)^6] - U(rc)
-        # F_vec = 24e[2(s^12/r^14) - (s^6/r^8)] * rij
-        inv_r2 = 1.0 / r2
-        sr2 = (self.sig * self.sig) * inv_r2
-        sr6 = sr2 ** 3
-        sr12 = sr6 ** 2
+        return forces, total_potential, total_virial
 
-        # Потенциальная энергия пары со сдвигом
-        u = 4.0 * self.eps * (sr12 - sr6) - self.U_shift
+    def reflect_at_sphere_boundary(self) -> None:
+        effective_radius = self.radius - 0.05 * self.sigma
 
-        # Векторная сила
-        coef = 24.0 * self.eps * (2.0 * sr12 - sr6) * inv_r2
-        fvec = coef * rij
+        for i in range(self.n_particles):
+            position = self.positions[i]
+            radius_sq = float(np.dot(position, position))
 
-        # Вириал пары для оценки давления: w = r_ij · F_ij
-        wij = np.dot(rij, fvec)
-
-        return fvec, u, wij
-
-    # -------------------------
-    # ГРАНИЦА СФЕРЫ
-    # -------------------------
-    def _reflect_from_sphere(self):
-        # Если частица вышла за сферу, отражаем скорость по нормали и возвращаем на границу
-        R_eff = self.R - 0.05 * self.sig
-        for i in range(self.N):
-            r = self.pos[i]
-            rr = np.dot(r, r)
-            if rr > R_eff * R_eff:
-                norm = np.sqrt(rr)
-                if norm < 1e-20:
+            if radius_sq > effective_radius**2:
+                radius_value = np.sqrt(radius_sq)
+                if radius_value < 1e-20:
                     continue
-                n = r / norm
 
-                # Перенос на поверхность чуть внутрь
-                self.pos[i] = n * R_eff
+                normal = position / radius_value
+                self.positions[i] = normal * effective_radius
 
-                # Отражение нормальной компоненты скорости
-                vn = np.dot(self.vel[i], n)
-                if vn > 0:
-                    self.vel[i] = self.vel[i] - (1.0 + self.p.wall_kick_damping) * vn * n
+                normal_velocity = float(np.dot(self.velocities[i], normal))
+                if normal_velocity > 0:
+                    self.velocities[i] -= (
+                        (1.0 + self.params.wall_restitution)
+                        * normal_velocity
+                        * normal
+                    )
 
-    # -------------------------
-    # ИНТЕГРИРОВАНИЕ (VELOCITY VERLET)
-    # -------------------------
-    def step(self):
-        dt = self.p.dt
-        m = self.p.mass
+    def step(self) -> None:
+        dt = self.params.dt
 
-        # x(t+dt) = x(t) + v(t)dt + (1/2m)F(t)dt^2
-        self.pos += self.vel * dt + 0.5 * (self.force / m) * dt * dt
+        self.positions += (
+            self.velocities * dt + 0.5 * (self.forces / self.mass) * dt * dt
+        )
 
-        # Граница сферы после шага координат
-        self._reflect_from_sphere()
+        self.reflect_at_sphere_boundary()
 
-        # Новые силы
-        new_force, U_new, vir_new = self.compute_forces_cell_list()
+        new_forces, new_potential, new_virial = self.compute_forces()
 
-        # v(t+dt) = v(t) + (1/2m)(F(t)+F(t+dt))dt
-        self.vel += 0.5 * (self.force + new_force) * (dt / m)
+        self.velocities += 0.5 * (self.forces + new_forces) * (dt / self.mass)
 
-        # Повторная коррекция для частиц, ушедших после обновления скоростей
-        self._reflect_from_sphere()
+        self.reflect_at_sphere_boundary()
 
-        self.force = new_force
-        self.potential_energy = U_new
-        self.virial = vir_new
+        self.forces = new_forces
+        self.potential_energy = new_potential
+        self.virial = new_virial
 
         self.time += dt
-        self.step_count += 1
+        self.step_index += 1
         self._log_state()
 
-    # -------------------------
-    # НАБЛЮДАЕМЫЕ ВЕЛИЧИНЫ
-    # -------------------------
-    def kinetic_energy(self):
-        return 0.5 * self.p.mass * np.sum(self.vel * self.vel)
+    def kinetic_energy(self) -> float:
+        return 0.5 * self.mass * float(np.sum(self.velocities * self.velocities))
 
-    def total_energy(self):
+    def total_energy(self) -> float:
         return self.kinetic_energy() + self.potential_energy
 
-    def instantaneous_temperature(self):
-        # При удаленном движении центра масс число степеней свободы примерно 3N-3
-        K = self.kinetic_energy()
-        dof = max(1, 3 * self.N - 3)
-        return 2.0 * K / dof
+    def instantaneous_temperature(self) -> float:
+        kinetic = self.kinetic_energy()
+        dof = max(1, 3 * self.n_particles - 3)
+        return 2.0 * kinetic / dof
 
-    def pressure_like(self):
-        # Оценка через вириальную формулу для сферы объема V = 4/3 pi R^3
-        # P = (N k_B T + (1/3) <sum r_ij·F_ij>/2? ) / V
-        # Здесь virial уже суммируется по парам один раз, поэтому используем P = (N T + virial/3) / V
-        V = 4.0 * np.pi * (self.R ** 3) / 3.0
-        T = self.instantaneous_temperature()
-        return (self.N * self.kB * T + self.virial / 3.0) / V
+    def pressure_estimate(self) -> float:
+        volume = (4.0 / 3.0) * np.pi * self.radius**3
+        temperature = self.instantaneous_temperature()
+        return (self.n_particles * self.k_b * temperature + self.virial / 3.0) / volume
 
-    def _log_state(self):
-        T = self.instantaneous_temperature()
-        self.energy_log.append((self.time, self.kinetic_energy(), self.potential_energy, self.total_energy()))
-        self.temp_log.append((self.time, T))
-        self.pressure_like_log.append((self.time, self.pressure_like()))
+    def _log_state(self) -> None:
+        kinetic = self.kinetic_energy()
+        potential = self.potential_energy
+        total = kinetic + potential
+        temperature = self.instantaneous_temperature()
+        pressure = self.pressure_estimate()
 
-        idx = int(np.clip(self.p.track_index, 0, self.N - 1))
-        self.track_log.append((self.time, self.pos[idx, 0], self.pos[idx, 1], self.pos[idx, 2]))
+        self.energy_log.append((self.time, kinetic, potential, total))
+        self.temperature_log.append((self.time, temperature))
+        self.pressure_log.append((self.time, pressure))
 
-    # -------------------------
-    # ВЫХОДНЫЕ ДАННЫЕ
-    # -------------------------
-    def save_logs_csv(self, base_path):
-        energy_path = base_path + "_energy.csv"
-        track_path = base_path + "_track.csv"
-        temp_path = base_path + "_temp_pressure.csv"
+        idx = int(np.clip(self.params.tracked_particle_index, 0, self.n_particles - 1))
+        x, y, z = self.positions[idx]
+        self.track_log.append((self.time, x, y, z))
 
-        with open(energy_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["time", "K", "U", "E"])
-            for row in self.energy_log[::max(1, self.p.save_every)]:
-                w.writerow(row)
+    def save_csv_logs(self, base_path: str) -> tuple[str, str, str]:
+        energy_path = f"{base_path}_energy.csv"
+        track_path = f"{base_path}_track.csv"
+        thermo_path = f"{base_path}_thermo.csv"
 
-        with open(track_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["time", "x", "y", "z"])
-            for row in self.track_log[::max(1, self.p.save_every)]:
-                w.writerow(row)
+        stride = max(1, self.params.save_every)
 
-        with open(temp_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["time", "T", "P_like"])
-            for i in range(0, len(self.temp_log), max(1, self.p.save_every)):
-                t, T = self.temp_log[i]
-                _, P = self.pressure_like_log[i]
-                w.writerow([t, T, P])
+        with open(energy_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time", "kinetic", "potential", "total"])
+            for row in self.energy_log[::stride]:
+                writer.writerow(row)
 
-        return energy_path, track_path, temp_path
+        with open(track_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time", "x", "y", "z"])
+            for row in self.track_log[::stride]:
+                writer.writerow(row)
+
+        with open(thermo_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time", "temperature", "pressure_estimate"])
+            for i in range(0, len(self.temperature_log), stride):
+                time_value, temperature = self.temperature_log[i]
+                _, pressure = self.pressure_log[i]
+                writer.writerow([time_value, temperature, pressure])
+
+        return energy_path, track_path, thermo_path
 
 
-# =========================
-# ВИЗУАЛИЗАЦИЯ
-# =========================
+class SimulationViewer3D:
+    def __init__(self, simulation: MolecularDynamicsLJ) -> None:
+        self.simulation = simulation
 
-class MDViewer:
-    def __init__(self, sim: LJMDInSphere):
-        self.sim = sim
+        self.figure = plt.figure(figsize=(10, 8))
+        self.axis = self.figure.add_subplot(111, projection="3d")
 
-        self.fig = plt.figure(figsize=(10, 8))
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        R = sim.R
-        self.ax.set_xlim(-R, R)
-        self.ax.set_ylim(-R, R)
-        self.ax.set_zlim(-R, R)
-        self.ax.set_xlabel("x")
-        self.ax.set_ylabel("y")
-        self.ax.set_zlabel("z")
-        self.ax.set_title("Молекулярная динамика в сфере: Lennard-Jones + Velocity Verlet")
+        r = self.simulation.radius
+        self.axis.set_xlim(-r, r)
+        self.axis.set_ylim(-r, r)
+        self.axis.set_zlim(-r, r)
+        self.axis.set_xlabel("x")
+        self.axis.set_ylabel("y")
+        self.axis.set_zlabel("z")
+        self.axis.set_title("Molecular Dynamics in Sphere: Lennard-Jones + Velocity Verlet")
 
-        # Сфера (каркас)
-        self._draw_sphere_wireframe(R)
+        self._draw_sphere_wireframe(r)
 
-        # Частицы
-        self.scat = self.ax.scatter([], [], [], s=6, alpha=0.75)
-        idx = int(np.clip(self.sim.p.track_index, 0, self.sim.N - 1))
-        self.scat_track = self.ax.scatter([], [], [], s=40)
+        self.scatter_particles = self.axis.scatter([], [], [], s=6, alpha=0.75)
+        self.scatter_tracked = self.axis.scatter([], [], [], s=40)
 
-        # Траектория отслеживаемой частицы
-        self.line_track, = self.ax.plot([], [], [], linewidth=1.2)
+        (self.track_line,) = self.axis.plot([], [], [], linewidth=1.2)
+        self.track_points: list[np.ndarray] = []
 
-        self.info = self.ax.text2D(0.02, 0.98, "", transform=self.ax.transAxes, va="top")
+        self.info_text = self.axis.text2D(
+            0.02,
+            0.98,
+            "",
+            transform=self.axis.transAxes,
+            va="top",
+        )
 
-        self.max_track = self.sim.p.max_traj_points
-        self.track_pts = []
+        self.animation: FuncAnimation | None = None
 
-    def _draw_sphere_wireframe(self, R):
+    def _draw_sphere_wireframe(self, radius: float) -> None:
         u = np.linspace(0, 2 * np.pi, 32)
         v = np.linspace(0, np.pi, 16)
-        x = R * np.outer(np.cos(u), np.sin(v))
-        y = R * np.outer(np.sin(u), np.sin(v))
-        z = R * np.outer(np.ones_like(u), np.cos(v))
-        self.ax.plot_wireframe(x, y, z, linewidth=0.25, alpha=0.2)
+        x = radius * np.outer(np.cos(u), np.sin(v))
+        y = radius * np.outer(np.sin(u), np.sin(v))
+        z = radius * np.outer(np.ones_like(u), np.cos(v))
+        self.axis.plot_wireframe(x, y, z, linewidth=0.25, alpha=0.2)
 
-    def _update(self, frame):
-        for _ in range(self.sim.p.steps_per_frame):
-            self.sim.step()
+    def _update(self, _frame: int):
+        for _ in range(self.simulation.params.steps_per_frame):
+            self.simulation.step()
 
-        P = self.sim.pos
-        self.scat._offsets3d = (P[:, 0], P[:, 1], P[:, 2])
-
-        idx = int(np.clip(self.sim.p.track_index, 0, self.sim.N - 1))
-        r = self.sim.pos[idx]
-        self.scat_track._offsets3d = (np.array([r[0]]), np.array([r[1]]), np.array([r[2]]))
-
-        self.track_pts.append(r.copy())
-        if len(self.track_pts) > self.max_track:
-            self.track_pts.pop(0)
-        tr = np.array(self.track_pts)
-        if len(tr) > 1:
-            self.line_track.set_data(tr[:, 0], tr[:, 1])
-            self.line_track.set_3d_properties(tr[:, 2])
-
-        K = self.sim.kinetic_energy()
-        U = self.sim.potential_energy
-        E = K + U
-        T = self.sim.instantaneous_temperature()
-        P_like = self.sim.pressure_like()
-
-        self.info.set_text(
-            f"N = {self.sim.N}\n"
-            f"t = {self.sim.time:.4f}\n"
-            f"dt = {self.sim.p.dt}\n"
-            f"K = {K:.4f}\n"
-            f"U = {U:.4f}\n"
-            f"E = {E:.4f}\n"
-            f"T = {T:.4f}\n"
-            f"P = {P_like:.4f}"
+        positions = self.simulation.positions
+        self.scatter_particles._offsets3d = (
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
         )
-        return self.scat, self.scat_track, self.line_track, self.info
 
-    def run(self):
-        self.anim = FuncAnimation(self.fig, self._update, interval=30, blit=False)
+        idx = int(
+            np.clip(
+                self.simulation.params.tracked_particle_index,
+                0,
+                self.simulation.n_particles - 1,
+            )
+        )
+        tracked_position = self.simulation.positions[idx]
+        self.scatter_tracked._offsets3d = (
+            np.array([tracked_position[0]]),
+            np.array([tracked_position[1]]),
+            np.array([tracked_position[2]]),
+        )
+
+        self.track_points.append(tracked_position.copy())
+        if len(self.track_points) > self.simulation.params.max_trajectory_points:
+            self.track_points.pop(0)
+
+        if len(self.track_points) > 1:
+            trajectory = np.array(self.track_points)
+            self.track_line.set_data(trajectory[:, 0], trajectory[:, 1])
+            self.track_line.set_3d_properties(trajectory[:, 2])
+
+        kinetic = self.simulation.kinetic_energy()
+        potential = self.simulation.potential_energy
+        total = kinetic + potential
+        temperature = self.simulation.instantaneous_temperature()
+        pressure = self.simulation.pressure_estimate()
+
+        self.info_text.set_text(
+            f"N = {self.simulation.n_particles}\n"
+            f"t = {self.simulation.time:.4f}\n"
+            f"dt = {self.simulation.params.dt}\n"
+            f"K = {kinetic:.4f}\n"
+            f"U = {potential:.4f}\n"
+            f"E = {total:.4f}\n"
+            f"T = {temperature:.4f}\n"
+            f"P = {pressure:.4f}"
+        )
+
+        return (
+            self.scatter_particles,
+            self.scatter_tracked,
+            self.track_line,
+            self.info_text,
+        )
+
+    def run(self) -> None:
+        self.animation = FuncAnimation(
+            self.figure,
+            self._update,
+            interval=30,
+            blit=False,
+        )
         plt.tight_layout()
         plt.show()
 
 
-# =========================
-# ГРАФИКИ ПОСЛЕ СИМУЛЯЦИИ
-# =========================
+class DiagnosticsPlotter:
+    @staticmethod
+    def show(simulation: MolecularDynamicsLJ) -> None:
+        energy = np.array(simulation.energy_log)
+        temperature = np.array(simulation.temperature_log)
+        pressure = np.array(simulation.pressure_log)
 
-def show_diagnostics(sim: LJMDInSphere):
-    e = np.array(sim.energy_log)
-    tp = np.array(sim.temp_log)
-    pp = np.array(sim.pressure_like_log)
+        fig_energy = plt.figure(figsize=(8, 5))
+        ax_energy = fig_energy.add_subplot(111)
+        ax_energy.plot(energy[:, 0], energy[:, 1], label="Kinetic")
+        ax_energy.plot(energy[:, 0], energy[:, 2], label="Potential")
+        ax_energy.plot(energy[:, 0], energy[:, 3], label="Total")
+        ax_energy.set_xlabel("t")
+        ax_energy.set_ylabel("Energy")
+        ax_energy.set_title("System Energy")
+        ax_energy.grid(True, alpha=0.3)
+        ax_energy.legend()
 
-    fig1 = plt.figure(figsize=(8, 5))
-    ax1 = fig1.add_subplot(111)
-    ax1.plot(e[:, 0], e[:, 1], label="K")
-    ax1.plot(e[:, 0], e[:, 2], label="U")
-    ax1.plot(e[:, 0], e[:, 3], label="E")
-    ax1.set_xlabel("t")
-    ax1.set_ylabel("energy")
-    ax1.set_title("Энергия системы")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+        fig_thermo = plt.figure(figsize=(8, 5))
+        ax_thermo = fig_thermo.add_subplot(111)
+        ax_thermo.plot(temperature[:, 0], temperature[:, 1], label="Temperature")
+        ax_thermo.plot(pressure[:, 0], pressure[:, 1], label="Pressure estimate")
+        ax_thermo.set_xlabel("t")
+        ax_thermo.set_ylabel("Value")
+        ax_thermo.set_title("Thermodynamic Diagnostics")
+        ax_thermo.grid(True, alpha=0.3)
+        ax_thermo.legend()
 
-    fig2 = plt.figure(figsize=(8, 5))
-    ax2 = fig2.add_subplot(111)
-    ax2.plot(tp[:, 0], tp[:, 1], label="T")
-    ax2.plot(pp[:, 0], pp[:, 1], label="P_like")
-    ax2.set_xlabel("t")
-    ax2.set_ylabel("value")
-    ax2.set_title("Температура и вириальная оценка давления")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.show()
+        plt.show()
 
 
-# =========================
-# GUI: ВВОД И ВЫВОД
-# =========================
-
-class MDApp:
-    def __init__(self):
+class MdSimulationApp:
+    def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("MD в сфере: Lennard-Jones + Максвелл-Больцман")
+        self.root.title("MD in Sphere: Lennard-Jones + Maxwell-Boltzmann")
 
-        self.entries = {}
-        self._build_ui()
-        self.sim = None
-
-    def _add_field(self, parent, row, label, default):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        e = ttk.Entry(parent, width=18)
-        e.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 0))
-        e.insert(0, str(default))
-        self.entries[label] = e
-
-    def _build_ui(self):
-        frm = ttk.Frame(self.root, padding=10)
-        frm.grid(row=0, column=0, sticky="nsew")
-        frm.columnconfigure(1, weight=1)
-
-        defaults = MDParams()
-
-        row = 0
-        self._add_field(frm, row, "N (число частиц)", defaults.n_particles); row += 1
-        self._add_field(frm, row, "R (радиус сферы)", defaults.sphere_radius); row += 1
-        self._add_field(frm, row, "dt", defaults.dt); row += 1
-        self._add_field(frm, row, "steps_per_frame", defaults.steps_per_frame); row += 1
-        self._add_field(frm, row, "mass", defaults.mass); row += 1
-        self._add_field(frm, row, "T (температура)", defaults.temperature); row += 1
-        self._add_field(frm, row, "epsilon", defaults.epsilon); row += 1
-        self._add_field(frm, row, "sigma", defaults.sigma); row += 1
-        self._add_field(frm, row, "cutoff (в sigma)", defaults.cutoff); row += 1
-        self._add_field(frm, row, "init_min_dist (в sigma)", defaults.init_min_dist); row += 1
-        self._add_field(frm, row, "track_index", defaults.track_index); row += 1
-        self._add_field(frm, row, "save_every", defaults.save_every); row += 1
-        self._add_field(frm, row, "seed (пусто=случайно)", ""); row += 1
-
-        self.auto_diag_var = tk.BooleanVar(value=True)
+        self.entries: dict[str, ttk.Entry] = {}
+        self.show_diagnostics_var = tk.BooleanVar(value=True)
         self.save_csv_var = tk.BooleanVar(value=False)
 
-        ttk.Checkbutton(frm, text="Показать графики после визуализации", variable=self.auto_diag_var)\
-            .grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2)); row += 1
-        ttk.Checkbutton(frm, text="Сохранить CSV после закрытия визуализации", variable=self.save_csv_var)\
-            .grid(row=row, column=0, columnspan=2, sticky="w", pady=2); row += 1
+        self.simulation: MolecularDynamicsLJ | None = None
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        self._build_ui()
 
-        ttk.Button(btns, text="Старт", command=self.run_sim).grid(row=0, column=0, padx=4)
-        ttk.Button(btns, text="Выход", command=self.root.destroy).grid(row=0, column=1, padx=4)
+    def _add_entry(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        default_value: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
 
-    def _read_params(self):
+        entry = ttk.Entry(parent, width=20)
+        entry.grid(row=row, column=1, sticky="ew", pady=3, padx=(8, 0))
+        entry.insert(0, default_value)
+
+        self.entries[label] = entry
+
+    def _build_ui(self) -> None:
+        frame = ttk.Frame(self.root, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        defaults = SimulationParameters()
+
+        fields = [
+            ("N (number of particles)", str(defaults.n_particles)),
+            ("Sphere radius R", str(defaults.sphere_radius)),
+            ("Time step dt", str(defaults.dt)),
+            ("Steps per frame", str(defaults.steps_per_frame)),
+            ("Particle mass", str(defaults.particle_mass)),
+            ("Temperature T", str(defaults.temperature)),
+            ("LJ epsilon", str(defaults.epsilon)),
+            ("LJ sigma", str(defaults.sigma)),
+            ("Cutoff (in sigma)", str(defaults.cutoff_sigma)),
+            ("Init min distance (in sigma)", str(defaults.init_min_distance_sigma)),
+            ("Tracked particle index", str(defaults.tracked_particle_index)),
+            ("Save every Nth point", str(defaults.save_every)),
+            ("Random seed (blank = random)", ""),
+        ]
+
+        row = 0
+        for label, default in fields:
+            self._add_entry(frame, row, label, default)
+            row += 1
+
+        ttk.Checkbutton(
+            frame,
+            text="Show diagnostics after animation",
+            variable=self.show_diagnostics_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        row += 1
+
+        ttk.Checkbutton(
+            frame,
+            text="Save CSV logs after animation",
+            variable=self.save_csv_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+        row += 1
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        ttk.Button(buttons, text="Start", command=self.start).grid(
+            row=0,
+            column=0,
+            padx=4,
+        )
+        ttk.Button(buttons, text="Exit", command=self.root.destroy).grid(
+            row=0,
+            column=1,
+            padx=4,
+        )
+
+    def _read_parameters(self) -> SimulationParameters:
+        seed_text = self.entries["Random seed (blank = random)"].get().strip()
+        seed = None if seed_text == "" else int(seed_text)
+
+        params = SimulationParameters(
+            n_particles=int(self.entries["N (number of particles)"].get()),
+            sphere_radius=float(self.entries["Sphere radius R"].get()),
+            dt=float(self.entries["Time step dt"].get()),
+            steps_per_frame=int(self.entries["Steps per frame"].get()),
+            particle_mass=float(self.entries["Particle mass"].get()),
+            temperature=float(self.entries["Temperature T"].get()),
+            epsilon=float(self.entries["LJ epsilon"].get()),
+            sigma=float(self.entries["LJ sigma"].get()),
+            cutoff_sigma=float(self.entries["Cutoff (in sigma)"].get()),
+            init_min_distance_sigma=float(
+                self.entries["Init min distance (in sigma)"].get()
+            ),
+            tracked_particle_index=int(self.entries["Tracked particle index"].get()),
+            save_every=int(self.entries["Save every Nth point"].get()),
+            seed=seed,
+        )
+
+        self._validate_parameters(params)
+        return params
+
+    @staticmethod
+    def _validate_parameters(params: SimulationParameters) -> None:
+        if params.n_particles < 2:
+            raise ValueError("Number of particles must be at least 2.")
+
+        if params.sphere_radius <= 0 or params.dt <= 0:
+            raise ValueError("Sphere radius and dt must be positive.")
+
+        if (
+            params.particle_mass <= 0
+            or params.temperature <= 0
+            or params.epsilon <= 0
+            or params.sigma <= 0
+        ):
+            raise ValueError("Mass, temperature, epsilon, and sigma must be positive.")
+
+        if params.cutoff_sigma <= 1.0:
+            raise ValueError("Cutoff (in sigma) should be greater than 1.0.")
+
+        if params.steps_per_frame < 1:
+            raise ValueError("Steps per frame must be at least 1.")
+
+        if params.save_every < 1:
+            raise ValueError("Save every Nth point must be at least 1.")
+
+    def start(self) -> None:
         try:
-            seed_text = self.entries["seed (пусто=случайно)"].get().strip()
-            seed = None if seed_text == "" else int(seed_text)
-
-            p = MDParams(
-                n_particles=int(self.entries["N (число частиц)"].get()),
-                sphere_radius=float(self.entries["R (радиус сферы)"].get()),
-                dt=float(self.entries["dt"].get()),
-                steps_per_frame=int(self.entries["steps_per_frame"].get()),
-                mass=float(self.entries["mass"].get()),
-                temperature=float(self.entries["T (температура)"].get()),
-                epsilon=float(self.entries["epsilon"].get()),
-                sigma=float(self.entries["sigma"].get()),
-                cutoff=float(self.entries["cutoff (в sigma)"].get()),
-                init_min_dist=float(self.entries["init_min_dist (в sigma)"].get()),
-                track_index=int(self.entries["track_index"].get()),
-                save_every=int(self.entries["save_every"].get()),
-                seed=seed
-            )
-
-            if p.n_particles < 2:
-                raise ValueError("N должно быть не меньше 2")
-            if p.sphere_radius <= 0 or p.dt <= 0:
-                raise ValueError("R и dt должны быть положительными")
-            if p.mass <= 0 or p.temperature <= 0 or p.epsilon <= 0 or p.sigma <= 0:
-                raise ValueError("mass, T, epsilon, sigma должны быть положительными")
-            if p.cutoff <= 1.0:
-                raise ValueError("cutoff должен быть больше 1 (обычно 2.5)")
-            if p.steps_per_frame < 1:
-                raise ValueError("steps_per_frame должно быть не меньше 1")
-
-            return p
-
-        except Exception as ex:
-            messagebox.showerror("Ошибка ввода", str(ex))
-            return None
-
-    def run_sim(self):
-        p = self._read_params()
-        if p is None:
+            params = self._read_parameters()
+        except Exception as error:
+            messagebox.showerror("Input Error", str(error))
             return
 
         try:
             self.root.withdraw()
 
-            self.sim = LJMDInSphere(p)
-            viewer = MDViewer(self.sim)
+            self.simulation = MolecularDynamicsLJ(params)
+            viewer = SimulationViewer3D(self.simulation)
             viewer.run()
 
-            if self.auto_diag_var.get():
-                show_diagnostics(self.sim)
+            if self.show_diagnostics_var.get():
+                DiagnosticsPlotter.show(self.simulation)
 
             if self.save_csv_var.get():
-                base = filedialog.asksaveasfilename(
-                    title="Сохранить CSV (укажите базовое имя)",
+                base_path = filedialog.asksaveasfilename(
+                    title="Save CSV logs (choose base file name)",
                     defaultextension="",
-                    filetypes=[("All files", "*.*")]
+                    filetypes=[("All files", "*.*")],
                 )
-                if base:
-                    epath, tpath, ppath = self.sim.save_logs_csv(base)
+                if base_path:
+                    energy_path, track_path, thermo_path = self.simulation.save_csv_logs(
+                        base_path
+                    )
                     messagebox.showinfo(
-                        "Сохранено",
-                        f"Файлы сохранены:\n{epath}\n{tpath}\n{ppath}"
+                        "Saved",
+                        f"Files saved:\n{energy_path}\n{track_path}\n{thermo_path}",
                     )
 
-        except Exception as ex:
-            messagebox.showerror("Ошибка симуляции", str(ex))
+        except Exception as error:
+            messagebox.showerror("Simulation Error", str(error))
         finally:
             self.root.deiconify()
 
-    def run(self):
+    def run(self) -> None:
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    MDApp().run()
+    MdSimulationApp().run()
